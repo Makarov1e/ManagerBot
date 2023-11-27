@@ -1,2 +1,2 @@
-bot_token = '6988045137:AAHUarhOhJD0A0RwDTkS7wVrGNMnwrJM7VY'
-api_key = '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'
+bot_token = '6988045137:AAEvjCeLz6je9Ktpt6Qwt2l1-EOUoIJcmVg'
+api_key = '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'
