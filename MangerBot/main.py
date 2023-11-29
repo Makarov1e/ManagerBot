@@ -38,16 +38,6 @@ async def on_shutdown(dp):
     if db_pool:
         await db_pool.close()
 
-async def connect_to_database():
-    # Замените параметры подключения на ваши
-    connection = await asyncpg.connect(
-        user=db_user,
-        password=db_password,
-        database=db_name,
-        host=db_host,
-        port=5432  # Используйте целое число, а не строку
-    )
-    return connection
 
 async def close_database_connection(connection):
     await connection.close()
@@ -91,6 +81,9 @@ async def get_user_tasks(dp, user_id):
 class AddTask(StatesGroup):
     WaitingForTask = State()
 
+class RemoveTask(StatesGroup):
+    WaitingForTask = State()
+
 @dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
     message_text = "Привет! Я твой бот-помощник для задач. Добавь задачу, отметь ее как выполненную или удали."
@@ -108,10 +101,8 @@ async def process_task(message: types.Message, state: FSMContext):
     task = message.text
     user_id = message.from_user.id
     await add_task_to_db(dp, user_id, task)
-    await message.answer(f"Задача '{task}' добавлена.")
-
-    # Сбрасываем состояние после завершения ввода
     await state.finish()
+    await message.answer(f"Задача '{task}' добавлена.")
 
 @dp.message_handler(commands=['list'])
 async def list_tasks(message: types.Message):
@@ -124,17 +115,20 @@ async def list_tasks(message: types.Message):
         await message.answer("У вас нет активных задач.")
 
 @dp.message_handler(commands=['remove'])
-async def remove_task(message: types.Message):
-    task = message.get_args()
-    if task:
-        user_id = message.from_user.id
-        removed = await remove_task_from_db(dp, user_id, task)
-        if removed:
-            await message.answer(f"Задача '{task}' удалена.")
-        else:
-            await message.answer("Указанной задачи не найдено.")
+async def remove_task_start(message: types.Message, state: FSMContext):
+    await RemoveTask.WaitingForTask.set()
+    await message.answer("Пожалуйста, укажите задачу для удаления.")
+
+@dp.message_handler(state=RemoveTask.WaitingForTask)
+async def remove_task(message: types.Message, state: FSMContext):
+    task = message.text
+    user_id = message.from_user.id
+    removed = await remove_task_from_db(dp, user_id, task)
+    await state.finish()
+    if removed:
+        await message.answer(f"Задача '{task}' удалена.")
     else:
-        await message.answer("Пожалуйста, укажите задачу для удаления.")
+        await message.answer("Указанной задачи не найдено.")
 
 if __name__ == '__main__':
     from aiogram import executor
