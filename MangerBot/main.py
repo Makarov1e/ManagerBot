@@ -24,11 +24,14 @@ dp.middleware.setup(LoggingMiddleware())
 add_task_button = InlineKeyboardButton("Добавить задачу", callback_data="add")
 remove_task_button = InlineKeyboardButton("Удалить задачу(и)", callback_data="remove")
 task_list_button = InlineKeyboardButton("Список задач", callback_data="list")
-set_deadline_button = InlineKeyboardButton("Установить дедлайн для задачи", callback_data="deadline")
+set_deadline_button = InlineKeyboardButton("Установить дедлайн", callback_data="deadline")
 clear_list_button = InlineKeyboardButton("Очистить список задач", callback_data="clear")
-task_keyboard = InlineKeyboardMarkup(row_width=2).add(add_task_button, remove_task_button, clear_list_button)
+edit_task_button = InlineKeyboardButton("Редактировать задачу", callback_data="edit")
+
+
+task_keyboard = InlineKeyboardMarkup(row_width=2).add(add_task_button, remove_task_button, edit_task_button, clear_list_button)
 list_keyboard = InlineKeyboardMarkup(row_width=2).add(task_list_button)
-after_add_keyboard = InlineKeyboardMarkup(row_width=2).add(task_list_button, add_task_button, set_deadline_button)
+after_add_keyboard = InlineKeyboardMarkup(row_width=2).add(set_deadline_button, task_list_button, add_task_button, )
 add_task_keyboard = InlineKeyboardMarkup(row_width=2).add(add_task_button)
 
 
@@ -140,13 +143,31 @@ async def add_deadline_to_db(dp, user_id, deadline):
                     await connection.execute("""UPDATE tasks SET deadline = $1 WHERE ctid = $2;""", deadline, task_ctid)
 
 
+async def get_task(dp, user_id, task_number):
+    db_pool = dp.get("db_pool")
+    if db_pool:
+        async with db_pool.acquire() as connection:
+            return await connection.fetchrow(
+                """
+                SELECT task, deadline
+                FROM (
+                    SELECT user_id, task, deadline AT TIME ZONE (SELECT tz::interval FROM users WHERE user_id = $1) AS deadline, 
+                    ROW_NUMBER () OVER (PARTITION BY user_id ORDER BY task_date) AS task_number FROM tasks
+                )
+                WHERE user_id = $1 AND task_number = $2;
+            """,
+                user_id,
+                task_number,
+            )
+
+
 async def get_user_tasks(dp, user_id):
     db_pool = dp.get("db_pool")
     if db_pool:
         async with db_pool.acquire() as connection:
             return await connection.fetch(
                 """
-                SELECT task, deadline AT TIME ZONE (
+                SELECT task, is_done, deadline AT TIME ZONE (
                     SELECT tz::interval FROM users WHERE user_id = $1
                     ) AS deadline
                 FROM tasks WHERE user_id = $1 ORDER BY task_date;
@@ -162,7 +183,7 @@ async def get_tz(dp, user_id):
             return await connection.fetchval(
                 """
                 SELECT tz FROM users WHERE user_id = $1;
-            """,
+                """,
                 user_id,
             )
 
@@ -183,6 +204,65 @@ async def clear_list(dp, user_id):
                 await connection.execute("""DELETE FROM tasks WHERE user_id = $1""", user_id)
 
 
+async def edit_task_deadline_in_db(dp, user_id, task_number, deadline):
+    db_pool = dp.get("db_pool")
+    if db_pool:
+        async with db_pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    UPDATE tasks SET deadline = $1, is_reminded = false WHERE ctid IN (
+                        SELECT ctid FROM (
+                            SELECT ctid, user_id, ROW_NUMBER () OVER (
+                            PARTITION BY user_id ORDER BY task_date) AS task_number FROM tasks
+                            ) 
+                        WHERE user_id = $2 AND task_number = $3);
+                        """,
+                    deadline,
+                    user_id,
+                    task_number
+                )
+
+
+async def edit_task_text_in_db(dp, user_id, task_number, task):
+    db_pool = dp.get("db_pool")
+    if db_pool:
+        async with db_pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    UPDATE tasks SET task = $1 WHERE ctid IN (
+                        SELECT ctid FROM (
+                            SELECT ctid, user_id, ROW_NUMBER () OVER (
+                            PARTITION BY user_id ORDER BY task_date) AS task_number FROM tasks
+                            ) 
+                        WHERE user_id = $2 AND task_number = $3);
+                        """,
+                    task,
+                    user_id,
+                    task_number
+                )
+
+
+async def set_is_done(dp, user_id, task_number):
+    db_pool = dp.get("db_pool")
+    if db_pool:
+        async with db_pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    UPDATE tasks SET is_done = TRUE WHERE ctid IN (
+                        SELECT ctid FROM (
+                            SELECT ctid, user_id, ROW_NUMBER () OVER (
+                            PARTITION BY user_id ORDER BY task_date) AS task_number FROM tasks
+                            ) 
+                        WHERE user_id = $1 AND task_number = $2);
+                        """,
+                    user_id,
+                    task_number
+                )
+
+
 class AddTask(StatesGroup):
     WaitingForTask = State()
 
@@ -197,6 +277,12 @@ class SetDeadline(StatesGroup):
 
 class AddTimezone(StatesGroup):
     WaitingForTimezone = State()
+
+
+class EditTask(StatesGroup):
+    WaitingForTaskNumber = State()
+    WaitingForText = State()
+    WaitingForDeadline = State()
 
 
 @dp.message_handler(commands=["start", "help"])
@@ -218,7 +304,7 @@ async def list_tasks(message: types.Message):
     user_tasks = await get_user_tasks(dp, user_id)
     if user_tasks:
         task_list = "\n".join(
-            f"<b>{str(i + 1)}.</b>\n    <b>Задача:</b> <i>{task['task']}</i>\n    <b>Дедлайн:</b> <i>{task['deadline'].strftime('%H:%M %d.%m.%y') if task['deadline'] else 'не установлен'}</i>"
+            f"<b>{str(i + 1)}. {'✅' if task['is_done'] else '❌'}</b>\n    <b>Задача:</b> <i>{task['task']}</i>\n    <b>Дедлайн:</b> <i>{task['deadline'].strftime('%H:%M %d.%m.%y') if task['deadline'] else 'не установлен'}</i>"
             for i, task in enumerate(user_tasks)
         )
         await message.answer(f"Ваши задачи:\n{task_list}", parse_mode="html", reply_markup=task_keyboard)
@@ -250,7 +336,7 @@ async def callback_list(call: types.callback_query):
     user_tasks = await get_user_tasks(dp, user_id)
     if user_tasks:
         task_list = "\n".join(
-            f"<b>{str(i + 1)}.</b>\n    <b>Задача:</b> <i>{task['task']}</i>\n    <b>Дедлайн:</b> <i>{task['deadline'].strftime('%H:%M %d.%m.%y') if task['deadline'] else 'не установлен'}</i>"
+            f"<b>{str(i + 1)}. {'✅' if task['is_done'] else '❌'}</b>\n    <b>Задача:</b> <i>{task['task']}</i>\n    <b>Дедлайн:</b> <i>{task['deadline'].strftime('%H:%M %d.%m.%y') if task['deadline'] else 'не установлен'}</i>"
             for i, task in enumerate(user_tasks)
         )
         await call.message.edit_text(f"Ваши задачи:\n{task_list}", parse_mode="html", reply_markup=task_keyboard)
@@ -258,22 +344,36 @@ async def callback_list(call: types.callback_query):
         await call.message.edit_text("У вас нет активных задач.", reply_markup=add_task_keyboard)
 
 
+@dp.callback_query_handler(lambda c: c.data == "edit")
+async def callback_edit(call: types.callback_query):
+    await EditTask.WaitingForTaskNumber.set()
+    await call.message.edit_text("Пожалуйста, укажите номер задачи для изменения.")
+
+
+@dp.callback_query_handler(lambda c: c.data == "edit_task_text")
+async def callback_edit_task_text(call: types.callback_query):
+    await EditTask.WaitingForText.set()
+    await call.message.edit_text("Введите новый текст задачи:")
+
+
+@dp.callback_query_handler(lambda c: c.data == "edit_task_deadline")
+async def callback_edit_task_deadline(call: types.callback_query):
+    await EditTask.WaitingForDeadline.set()
+    await call.message.edit_text("Введите новый дедлайн в формате ГГГГ-ММ-ДД чч:мм:сс")
+
+
+@dp.callback_query_handler(lambda c: c.data == "edit_task_status")
+async def callback_edit_task_status(call: types.callback_query, state: FSMContext):
+    task_number = int((await state.get_data())["task_number"])
+    await set_is_done(dp, call.from_user.id, task_number)
+    await call.message.edit_text("Задача отмечена как выполненная.", reply_markup=list_keyboard)
+    await state.finish()
+
+
 @dp.callback_query_handler(lambda c: c.data == "deadline")
 async def callback_deadline(call: types.callback_query):
     await SetDeadline.WaitingForDeadline.set()
     await call.message.edit_text("Введите дату и время в формате ГГГГ-ММ-ДД чч:мм:сс")
-
-
-# @dp.message_handler(commands=['add'])
-# async def add_task(message: types.Message, state: FSMContext):
-#     # Сообщаем ожидаемому состоянию, что мы ждем ввода задачи
-#     await AddTask.WaitingForTask.set()
-#     await message.answer("Пожалуйста, укажите задачу для добавления.")
-
-# @dp.message_handler(commands=['remove'])
-# async def remove_task_start(message: types.Message, state: FSMContext):
-#     await RemoveTask.WaitingForTask.set()
-#     await message.answer("Пожалуйста, укажите задачу для удаления.")
 
 
 @dp.message_handler(state=AddTask.WaitingForTask)
@@ -297,7 +397,7 @@ async def remove_task(message: types.Message, state: FSMContext):
         await message.answer("Указанной задачи не найдено.", reply_markup=list_keyboard)
 
 
-@dp.message_handler(state=SetDeadline)
+@dp.message_handler(state=SetDeadline.WaitingForDeadline)
 async def set_deadline(message: types.Message, state: FSMContext):
     deadline_str = message.text + " " + await get_tz(dp, message.from_user.id)
     deadline = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M:%S %z")
@@ -307,13 +407,45 @@ async def set_deadline(message: types.Message, state: FSMContext):
     await message.answer(f"Дедлайн добавлен.", reply_markup=list_keyboard)
 
 
-@dp.message_handler(state=AddTimezone)
+@dp.message_handler(state=AddTimezone.WaitingForTimezone)
 async def set_timezone(message: types.Message, state: FSMContext):
     timezone = message.text
     user_id = message.from_user.id
     await add_timezone_to_db(dp, user_id, timezone)
     await state.finish()
     await message.answer(f"Часовой пояс добавлен.", reply_markup=list_keyboard)
+
+
+@dp.message_handler(state=EditTask.WaitingForTaskNumber)
+async def edit_task(message: types.Message, state: FSMContext):
+    await state.update_data(task_number=message.text)
+    task_number = int(message.text)
+    task = await get_task(dp, message.from_user.id, task_number)
+    await state.reset_state(with_data=False)
+    await message.answer(
+        f"<b>Задача:</b> <i>{task['task']}</i>\n<b>Дедлайн:</b> <i>{task['deadline'].strftime('%H:%M %d.%m.%y') if task['deadline'] else 'не установлен'}</i>",
+        parse_mode='html',
+        reply_markup=InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("Изменить задачу", callback_data="edit_task_text"),
+                                                InlineKeyboardButton("Изменить дедлайн", callback_data="edit_task_deadline"),
+                                                InlineKeyboardButton("Отметить выполнение", callback_data="edit_task_status")))
+
+
+@dp.message_handler(state=EditTask.WaitingForText)
+async def edit_task_text(message: types.Message, state: FSMContext):
+    task_number = int((await state.get_data())["task_number"])
+    await edit_task_text_in_db(dp, message.from_user.id, task_number, message.text)
+    await message.answer("Текст задачи изменен.", reply_markup=list_keyboard)
+    await state.finish()
+
+
+@dp.message_handler(state=EditTask.WaitingForDeadline)
+async def edit_task_deadline(message: types.Message, state: FSMContext):
+    task_number = int((await state.get_data())["task_number"])
+    deadline_str = message.text + " " + await get_tz(dp, message.from_user.id)
+    deadline = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M:%S %z")
+    await edit_task_deadline_in_db(dp, message.from_user.id, task_number, deadline)
+    await message.answer("Дедлайн изменен.", reply_markup=list_keyboard)
+    await state.finish()
 
 
 async def remind():
