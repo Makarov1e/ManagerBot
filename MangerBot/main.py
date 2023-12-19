@@ -10,10 +10,9 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import (BotCommand, InlineKeyboardButton,
-                           InlineKeyboardMarkup)
+                           InlineKeyboardMarkup, CallbackQuery)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import bot_token, api_key, db_host, db_name, db_password, db_user
-from message_templates import message_templates
 
 import openai
 
@@ -296,11 +295,18 @@ class EditTask(StatesGroup):
     WaitingForDeadline = State()
 
 
-@dp.message_handler(commands=["start", "help"])
-async def send_welcome(message: types.Message):
-    message_text = "Привет! Я твой бот-помощник для задач. Добавь задачу, отметь ее как выполненную или удали."
-    await add_user_to_db(dp, message.from_user.id)
-    await message.answer(message_text, reply_markup=list_keyboard)
+@dp.message_handler(commands=["start", "help"], state="*")
+async def send_welcome(message: types.Message, state: FSMContext):
+    # Проверяем, активен ли режим ChatGPTMode
+    if await state.get_state() == ChatGPTMode.ENABLED.state:
+        # Сбрасываем состояние ChatGPTMode
+        await state.finish()
+        await message.answer("Режим ChatGPT выключен. Теперь вы можете использовать обычные команды.")
+    else:
+        message_text = "Привет! Я твой бот-помощник для задач. Добавь задачу, отметь ее как выполненную или удали."
+        await add_user_to_db(dp, message.from_user.id)
+        await message.answer(message_text, reply_markup=list_keyboard)
+
 
 
 @dp.message_handler(commands=["timezone"])
@@ -483,100 +489,88 @@ async def run_scheduler():
 '''ЧАСТЬ КОДА С ЧАТИКОМ'''
 
 
+# Создаем класс для хранения состояний
+class ChatGPTMode(StatesGroup):
+    ENABLED = State()
+
+
+# Пример простого хранилища в оперативной памяти
+chatgpt_storage = {}
+
+
+# Функция для установки состояния ChatGPT
+async def set_chatgpt_enabled(user_id: str, enabled: bool):
+    chatgpt_storage[user_id] = enabled
+
+
+# Функция для получения состояния ChatGPT
+async def is_chatgpt_enabled(user_id: str) -> bool:
+    return chatgpt_storage.get(user_id, False)
+
+
+# Обработчик команды /chatgpt
 @dp.message_handler(commands=['chatgpt'])
-async def enable_chatgpt(message: types.Message):
-    # Check if ChatGPT is already enabled for the user
-    chatgpt_enabled = await dp.storage.get_data(user=message.from_user.id)
-    if chatgpt_enabled and chatgpt_enabled.get("chatgpt_enabled", False):
-        await message.answer("ChatGPT уже включен.")
-    else:
-        # Создаем инлайновую клавиатуру с кнопкой "Включить ChatGPT"
-        keyboard = InlineKeyboardMarkup()
-        enable_button = InlineKeyboardButton("Включить ChatGPT", callback_data='enable_chatgpt')
-        disable_button = InlineKeyboardButton("Выключить ChatGPT", callback_data='disable_chatgpt')
-        keyboard.add(enable_button, disable_button)
-
-        # Отправляем сообщение с клавиатурой
-        await message.answer("Режим ChatGPT", reply_markup=keyboard)
+async def cmd_chatgpt(message: types.Message, state: FSMContext):
+    chat_gpt_button = InlineKeyboardButton("Включить ChatGPT", callback_data='enable_chatgpt')
+    keyboard = InlineKeyboardMarkup(row_width=1).add(chat_gpt_button)
+    await message.answer("Режим работы с ChatGPT. Для выхода из режима общения с ChatGPT введите любую команду либо выберите её из меню команд.", reply_markup=keyboard)
 
 
-@dp.callback_query_handler(lambda c: c.data == 'enable_chatgpt')
-async def enable_chatgpt_callback(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
+# Обработчик callback-запроса
+@dp.callback_query_handler(lambda c: c.data in ['enable_chatgpt'])
+async def chatgpt_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    try:
+        await bot.answer_callback_query(callback_query.id)
 
-    # Отправляем сообщение с подтверждением включения режима ChatGPT
-    await bot.send_message(callback_query.from_user.id, "Режим ChatGPT включен. Теперь вы можете отправлять сообщения для общения с ChatGPT.")
+        user_id = str(callback_query.from_user.id)
+        is_enable = callback_query.data == 'enable_chatgpt'
 
-    # Переводим бота в режим ответов ChatGPT
-    await dp.storage.update_data(user=callback_query.from_user.id, data={"chatgpt_enabled": True})
+        if is_enable:
+            await set_chatgpt_enabled(user_id, True)
+            await bot.send_message(user_id, "Режим ChatGPT включен. Теперь вы можете отправлять сообщения для общения с ChatGPT.")
+            # Устанавливаем состояние ENABLED
+            await ChatGPTMode.ENABLED.set()
+        else:
+            await set_chatgpt_enabled(user_id, False)
+            await bot.send_message(user_id, "Режим ChatGPT выключен. Бот больше не будет отвечать на ваши сообщения.")
+            # Удаляем состояние ENABLED
+            await state.finish()
+
+            # Проверяем, был ли это callback-запрос
+            if callback_query.message:
+                await bot.delete_message(callback_query.message.chat.id, callback_query.message.message_id)
+
+    except Exception as e:
+        logging.error(f"Error in chatgpt_callback: {e}")
 
 
-@dp.callback_query_handler(lambda c: c.data == 'disable_chatgpt')
-async def disable_chatgpt_callback(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
 
-    # Отправляем сообщение с подтверждением выключения режима ChatGPT
-    await bot.send_message(callback_query.from_user.id, "Режим ChatGPT выключен. Теперь бот больше не будет отвечать на ваши сообщения.")
+# Обработчик сообщений в режиме ChatGPT
+@dp.message_handler(lambda message: message.text, state=ChatGPTMode.ENABLED)
+async def chatgpt_response(message: types.Message, state: FSMContext):
+    user_id = str(message.from_user.id)  # Изменяет user ID на строку
 
-    # Отключаем режим ответов ChatGPT
-    await dp.storage.update_data(user=callback_query.from_user.id, data={"chatgpt_enabled": False})
-
-    # Автоматически вызываем код, который соответствует команде /start
-    await bot.send_message(callback_query.from_user.id, "Можете продолжить работу с таск менеджером при помощи команды /start")
-
-
-@dp.message_handler()
-async def echo_msg(message: types.Message):
     try:
         user_message = message.text
-        userid = message.from_user.username
 
-        if is_bot_running:
-            if userid not in messages:
-                messages[userid] = []
-            messages[userid].append({"role": "user", "content": user_message})
-            messages[userid].append({"role": "user",
-                                    "content": f"chat: {message.chat} Now {time.strftime('%d/%m/%Y %H:%M:%S')} user: {message.from_user.first_name} message: {message.text}"})
-            logging.info(f'{userid}: {user_message}')
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-            should_respond = not message.reply_to_message or message.reply_to_message.from_user.id == bot.id
+        prompt = f"You are a helpful assistant.\nUser: {user_message}\nAssistant:"
+        response = openai.Completion.create(
+            engine="text-davinci-003",  # Использует "text-davinci-003" for GPT-3.5-turbo
+            prompt=prompt,
+            max_tokens=2500,
+            temperature=0.7,
+            frequency_penalty=0,
+            presence_penalty=0,
+            user=user_id
+        )
 
-            if should_respond:
-                await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        chatgpt_response = response['choices'][0]['text']
 
-                try:
-                    logging.info("Before ChatGPT completion")
-                    completion = await openai.ChatCompletion.acreate(
-                        model="gpt-3.5-turbo-1106",
-                        messages=messages[userid],
-                        max_tokens=2500,
-                        temperature=0.7,
-                        frequency_penalty=0,
-                        presence_penalty=0,
-                        user=userid
-                    )
-                    logging.info("After ChatGPT completion")
-                    chatgpt_response = completion.choices[0]['message']
-                    logging.info(f'ChatGPT response: {chatgpt_response}')
-
-                    messages[userid].append({"role": "assistant", "content": chatgpt_response['content']})
-                    logging.info(f'Ответ ChatGPT: {chatgpt_response["content"]}')
-
-                    await message.reply(chatgpt_response['content'])
-                except Exception as ex:
-                    logging.error(f"Error during ChatGPT completion: {ex}")
-
+        await message.reply(chatgpt_response)
     except Exception as ex:
-        if ex == "context_length_exceeded":
-            language = user_languages.get(message.from_user.id, 'ru')
-
-            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-
-            await message.reply(message_templates[language]['error'])
-            await echo_msg(message)
-
-
-
+        logging.error(f"Error during ChatGPT completion: {ex}")
 
 
 if __name__ == "__main__":
